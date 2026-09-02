@@ -3,11 +3,30 @@
 export type CellValue = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
 export type Board = CellValue[]; // length 81, row-major (row * 9 + col)
 
+export type SolverAlgorithm = 'dlx' | 'backtracking' | 'constraint-propagation';
+
+/**
+ * One event in a solver's step trace, replayed by the UI as an animation.
+ *  - 'try': tentatively places `digit` at `index` (may later be undone by 'remove')
+ *  - 'place': places `digit` at `index` with logical certainty (never undone)
+ *  - 'remove': undoes a previous 'try' at `index` (dead end / backtrack)
+ *  - 'note': no board change, just a caption (e.g. "Starting logical pass")
+ */
+export interface SolveStep {
+  kind: 'try' | 'place' | 'remove' | 'note';
+  index: number;
+  digit?: CellValue;
+  message: string;
+}
+
 export interface SolverResult {
   solved: boolean;
   solution?: Board;
   diagnostics?: string;
   elapsedMs: number;
+  /** Step-by-step trace for animated replay, in solve order. */
+  steps?: SolveStep[];
+  algorithm?: SolverAlgorithm;
 }
 
 export interface CellRecognition {

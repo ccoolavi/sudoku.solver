@@ -34,6 +34,10 @@ async function getWorker(): Promise<Tesseract.Worker> {
       tessedit_char_whitelist: '123456789',
       tessedit_pageseg_mode: '10' as any, // PSM.SINGLE_CHAR
       preserve_interword_spaces: '0',
+      // Synthetic crops carry no real DPI metadata; Tesseract's layout/shape
+      // analysis is tuned around print-scan DPIs and behaves better once told
+      // one explicitly rather than guessing from a tiny cell image.
+      user_defined_dpi: '300' as any,
     });
     return worker;
   })();
@@ -143,6 +147,69 @@ function hasInk(img: ImageData, minInkRatio = 0.04): boolean {
 }
 
 /**
+ * Tightly re-frames a preprocessed (black-on-white) cell around the ink's
+ * bounding box before OCR.
+ *
+ * The CV pipeline crops each cell with a fixed 10% border trim, so a digit
+ * drawn slightly large or off-center in the photo can end up small, uneven,
+ * or with its loop close to the crop edge — and a 6 vs 9 is distinguished
+ * almost entirely by that loop's position, so the fixed-trim crop was the
+ * main source of 6/9 (and to a lesser extent other) misreads. Cropping to
+ * the actual ink instead of a fixed margin, then upscaling to a consistent
+ * size, gives Tesseract the same normalized framing for every cell
+ * regardless of how the digit happened to sit in the original photo.
+ */
+function tightCropToInk(img: ImageData, targetSize = 64, padRatio = 0.22): ImageData {
+  const { data, width, height } = img;
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      if (data[i] < 128) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < minX || maxY < minY) return img; // no ink found — leave as-is
+
+  const boxSide = Math.max(maxX - minX + 1, maxY - minY + 1);
+  const pad = Math.round(boxSide * padRatio);
+  const half = boxSide / 2 + pad;
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+
+  let sx = Math.round(cx - half);
+  let sy = Math.round(cy - half);
+  let s = Math.round(half * 2);
+  sx = Math.max(0, Math.min(sx, width - 1));
+  sy = Math.max(0, Math.min(sy, height - 1));
+  s = Math.max(1, Math.min(s, width - sx, height - sy));
+
+  const srcCanvas = document.createElement('canvas');
+  srcCanvas.width = width;
+  srcCanvas.height = height;
+  srcCanvas.getContext('2d')!.putImageData(img, 0, 0);
+
+  const outCanvas = document.createElement('canvas');
+  outCanvas.width = targetSize;
+  outCanvas.height = targetSize;
+  const outCtx = outCanvas.getContext('2d')!;
+  outCtx.fillStyle = '#fff';
+  outCtx.fillRect(0, 0, targetSize, targetSize);
+  outCtx.imageSmoothingEnabled = true;
+  outCtx.imageSmoothingQuality = 'high';
+  outCtx.drawImage(srcCanvas, sx, sy, s, s, 0, 0, targetSize, targetSize);
+
+  return outCtx.getImageData(0, 0, targetSize, targetSize);
+}
+
+/**
  * Recognize all 81 cells. Returns a parallel array of CellRecognition objects.
  *
  * The cells are processed sequentially to avoid hammering Tesseract's
@@ -172,10 +239,11 @@ export async function recognizeCells(
     }
 
     const preprocessed = preprocessCell(cell);
+    const framed = tightCropToInk(preprocessed);
     const canvas = document.createElement('canvas');
-    canvas.width = preprocessed.width;
-    canvas.height = preprocessed.height;
-    canvas.getContext('2d')!.putImageData(preprocessed, 0, 0);
+    canvas.width = framed.width;
+    canvas.height = framed.height;
+    canvas.getContext('2d')!.putImageData(framed, 0, 0);
 
     let digit: CellValue = 0;
     let confidence = 0;

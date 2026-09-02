@@ -1,6 +1,7 @@
-import { Board, EMPTY_BOARD } from '@/lib/sudoku/types';
+import { Board, EMPTY_BOARD, SolverAlgorithm } from '@/lib/sudoku/types';
 
 const STORAGE_KEY = 'sudoku-solver:v1';
+const PREFS_KEY = 'sudoku-solver:prefs:v1';
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 export type PersistedStage = 'review' | 'solved';
@@ -15,6 +16,7 @@ export interface PersistedPuzzle {
   solution: Board | null;
   solvedIndices: number[];
   solverElapsedMs: number | null;
+  solverAlgorithm: SolverAlgorithm | null;
   /** Warped board preview, stored as a PNG data URL (small enough for localStorage). */
   warpedPreviewDataUrl: string | null;
 }
@@ -61,4 +63,35 @@ export function clearPuzzleState(): void {
 
 export function emptyBoard(): Board {
   return EMPTY_BOARD.slice() as Board;
+}
+
+export interface SolverPrefs {
+  algorithm: SolverAlgorithm;
+  animateSolving: boolean;
+}
+
+const DEFAULT_PREFS: SolverPrefs = { algorithm: 'dlx', animateSolving: true };
+
+export function loadPrefs(): SolverPrefs {
+  if (typeof window === 'undefined') return DEFAULT_PREFS;
+  try {
+    const raw = window.localStorage.getItem(PREFS_KEY);
+    if (!raw) return DEFAULT_PREFS;
+    const parsed = JSON.parse(raw);
+    return {
+      algorithm: parsed.algorithm ?? DEFAULT_PREFS.algorithm,
+      animateSolving: typeof parsed.animateSolving === 'boolean' ? parsed.animateSolving : DEFAULT_PREFS.animateSolving,
+    };
+  } catch {
+    return DEFAULT_PREFS;
+  }
+}
+
+export function savePrefs(prefs: SolverPrefs): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    // ignore — preference persistence is a convenience, not load-bearing
+  }
 }

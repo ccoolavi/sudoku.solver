@@ -1,4 +1,4 @@
-import { Board, SolverResult } from './types';
+import { Board, rowOf, colOf, SolveStep, SolverResult } from './types';
 import { validateBoard } from './validator';
 
 /**
@@ -232,11 +232,17 @@ function applyGivens(
   return { ok: true, selected };
 }
 
+function candidateLabel(candidateRow: number): { cell: number; digit: number } {
+  return { cell: Math.floor(candidateRow / 9), digit: (candidateRow % 9) + 1 };
+}
+
 function search(
   root: ColumnNode,
   solution: number[],
   maxNodes: number,
   counter: { nodes: number },
+  steps: SolveStep[] | null,
+  maxSteps: number,
 ): boolean {
   if (counter.nodes > maxNodes) return false;
   if (root.R === root) {
@@ -248,12 +254,23 @@ function search(
   counter.nodes++;
   cover(col);
   for (let r = col.D as DLXNode; r !== col; r = r.D as DLXNode) {
-    solution.push((r as DataNode).row);
+    const candidateRow = (r as DataNode).row;
+    solution.push(candidateRow);
     for (let j = r.R; j !== r; j = j.R) {
       cover((j as DataNode).C);
     }
 
-    if (search(root, solution, maxNodes, counter)) {
+    if (steps && steps.length < maxSteps) {
+      const { cell, digit } = candidateLabel(candidateRow);
+      steps.push({
+        kind: 'try',
+        index: cell,
+        digit: digit as SolveStep['digit'],
+        message: `Placing ${digit} at R${rowOf(cell) + 1}C${colOf(cell) + 1}`,
+      });
+    }
+
+    if (search(root, solution, maxNodes, counter, steps, maxSteps)) {
       return true;
     }
 
@@ -262,18 +279,35 @@ function search(
       uncover((j as DataNode).C);
     }
     solution.pop();
+
+    if (steps && steps.length < maxSteps) {
+      const { cell, digit } = candidateLabel(candidateRow);
+      steps.push({
+        kind: 'remove',
+        index: cell,
+        digit: digit as SolveStep['digit'],
+        message: `Dead end — backing out of ${digit} at R${rowOf(cell) + 1}C${colOf(cell) + 1}`,
+      });
+    }
   }
   uncover(col);
   return false;
+}
+
+export interface SolveOptions {
+  maxNodes?: number;
+  /** Record a step trace for animated replay (capped at maxSteps events). */
+  recordSteps?: boolean;
+  maxSteps?: number;
 }
 
 /**
  * Solve a Sudoku board using DLX.
  *
  * @param board 81-cell row-major board (0 = blank)
- * @param maxNodes safety bound to prevent runaway search
  */
-export function solveSudoku(board: Board, maxNodes = 200_000): SolverResult {
+export function solveSudoku(board: Board, options: SolveOptions = {}): SolverResult {
+  const { maxNodes = 200_000, recordSteps = false, maxSteps = 1000 } = options;
   const start = (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
   // Quick structural validation - reject duplicates up front so DLX does not silently fail.
@@ -298,7 +332,8 @@ export function solveSudoku(board: Board, maxNodes = 200_000): SolverResult {
 
   const solution: number[] = [];
   const counter = { nodes: 0 };
-  const ok = search(root, solution, maxNodes, counter);
+  const steps: SolveStep[] | null = recordSteps ? [] : null;
+  const ok = search(root, solution, maxNodes, counter, steps, maxSteps);
 
   if (!ok) {
     if (counter.nodes >= maxNodes) {
@@ -326,6 +361,8 @@ export function solveSudoku(board: Board, maxNodes = 200_000): SolverResult {
     solved: true,
     solution: out,
     elapsedMs: elapsedSince(start),
+    steps: steps ?? undefined,
+    algorithm: 'dlx',
   };
 }
 

@@ -14,6 +14,8 @@ export interface EditableGridProps {
   conflictIndices?: Set<number>;
   /** Cell indices that were filled by the solver (highlighted as "solved"). */
   solvedIndices?: Set<number>;
+  /** Cell currently being animated during solve replay (pulses amber). */
+  activeIndex?: number | null;
   /** Per-cell OCR confidence (0..1). Used to render a subtle indicator. */
   confidence?: Array<number | undefined>;
   /** Disable editing (e.g., during processing). */
@@ -40,6 +42,7 @@ export function EditableGrid({
   recognizedIndices,
   conflictIndices,
   solvedIndices,
+  activeIndex,
   confidence,
   readOnly,
   onChange,
@@ -134,6 +137,7 @@ export function EditableGrid({
           const isSolved = solvedIndices?.has(i) ?? false;
           const isConflict = conflictIndices?.has(i) ?? false;
           const isFocused = focusedIndex === i;
+          const isActive = activeIndex === i;
           const conf = confidence?.[i];
 
           // Thick borders between 3x3 boxes
@@ -145,7 +149,9 @@ export function EditableGrid({
             c === 8 ? 'border-r-2' : '',
           ].join(' ');
 
-          const bg = isConflict
+          const bg = isActive
+            ? 'bg-amber-200 dark:bg-amber-500/30'
+            : isConflict
             ? 'bg-red-100 dark:bg-red-950/40'
             : isSolved
             ? 'bg-blue-50 dark:bg-blue-950/30'
@@ -175,8 +181,9 @@ export function EditableGrid({
               onFocus={() => setFocusedIndex(i)}
               onKeyDown={(e) => !readOnly && handleKey(e, i)}
               className={cn(
-                'relative flex min-h-11 items-center justify-center outline-none transition-colors',
+                'relative flex min-h-11 items-center justify-center outline-none transition-colors duration-150',
                 'focus-visible:ring-2 focus-visible:ring-primary focus-visible:z-10',
+                isActive && 'z-10 ring-2 ring-amber-500 scale-105',
                 borderClasses,
                 bg,
                 text,

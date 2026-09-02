@@ -17,6 +17,7 @@ import {
   Camera,
   CheckCircle2,
   ClipboardPaste,
+  FastForward,
   Hash,
   History,
   ImageIcon,
@@ -25,20 +26,23 @@ import {
   Sparkles,
   Trash2,
   Trophy,
+  Wand2,
   WifiOff,
 } from 'lucide-react';
-import { Board, CellValue, EMPTY_BOARD, SolverResult, solveSudoku } from '@/lib/sudoku/solver-wrapper';
+import { ALGORITHMS, Board, CellValue, EMPTY_BOARD, SolveStep, SolverAlgorithm, solve } from '@/lib/sudoku/solver-wrapper';
 import { validateBoard } from '@/lib/sudoku/validator';
 import { extractBoard, imageDataToCanvas } from '@/lib/cv/processImage';
 import { recognizeCells } from '@/lib/ocr/recognizer';
 import {
   clearPuzzleState,
+  loadPrefs,
   loadPuzzleState,
   PersistedPuzzle,
+  savePrefs,
   savePuzzleState,
 } from '@/lib/persistence/localStorage';
 
-type Stage = 'capture' | 'processing' | 'review' | 'solved';
+type Stage = 'capture' | 'processing' | 'review' | 'solving' | 'solved';
 
 const SAMPLE_PUZZLES: Array<{ name: string; givens: string }> = [
   {
@@ -70,7 +74,36 @@ export default function Home() {
   const [recognizedSet, setRecognizedSet] = useState<Set<number>>(new Set());
   const [solution, setSolution] = useState<Board | null>(null);
   const [solvedSet, setSolvedSet] = useState<Set<number>>(new Set());
-  const [solverMeta, setSolverMeta] = useState<{ elapsedMs: number } | null>(null);
+  const [solverMeta, setSolverMeta] = useState<{ elapsedMs: number; algorithm: SolverAlgorithm } | null>(null);
+
+  // Algorithm choice + animate-solving toggle, remembered across sessions.
+  const [prefs, setPrefsState] = useState(() => loadPrefs());
+  const algorithm = prefs.algorithm;
+  const animateSolving = prefs.animateSolving;
+  const setAlgorithm = useCallback((a: SolverAlgorithm) => {
+    setPrefsState((p) => {
+      const next = { ...p, algorithm: a };
+      savePrefs(next);
+      return next;
+    });
+  }, []);
+  const setAnimateSolving = useCallback((v: boolean) => {
+    setPrefsState((p) => {
+      const next = { ...p, animateSolving: v };
+      savePrefs(next);
+      return next;
+    });
+  }, []);
+
+  // Solve animation: `solve()` always runs at full computer speed — these
+  // only replay its recorded step trace at a human-watchable pace afterward.
+  const [solvingSteps, setSolvingSteps] = useState<SolveStep[] | null>(null);
+  const [solvingIndex, setSolvingIndex] = useState(0);
+  const [liveBoard, setLiveBoard] = useState<Board | null>(null);
+  const [liveCaption, setLiveCaption] = useState('');
+  const [liveActiveIndex, setLiveActiveIndex] = useState<number | null>(null);
+  const [pendingSolution, setPendingSolution] = useState<Board | null>(null);
+  const [pendingMeta, setPendingMeta] = useState<{ elapsedMs: number; algorithm: SolverAlgorithm } | null>(null);
 
   // Offer to resume a previous session's puzzle (survives closing the browser —
   // it's read from localStorage, not from a server, so this works fully offline).
@@ -107,6 +140,7 @@ export default function Home() {
         solution,
         solvedIndices: Array.from(solvedSet),
         solverElapsedMs: solverMeta?.elapsedMs ?? null,
+        solverAlgorithm: solverMeta?.algorithm ?? null,
         warpedPreviewDataUrl,
       });
     }, 400);
@@ -119,7 +153,11 @@ export default function Home() {
     setRecognizedSet(new Set(saved.recognizedIndices));
     setSolution(saved.solution);
     setSolvedSet(new Set(saved.solvedIndices));
-    setSolverMeta(saved.solverElapsedMs != null ? { elapsedMs: saved.solverElapsedMs } : null);
+    setSolverMeta(
+      saved.solverElapsedMs != null
+        ? { elapsedMs: saved.solverElapsedMs, algorithm: saved.solverAlgorithm ?? 'dlx' }
+        : null,
+    );
     if (saved.warpedPreviewDataUrl) {
       const img = new Image();
       img.onload = () => {
@@ -155,6 +193,13 @@ export default function Home() {
     setErrorMsg(null);
     setCvProgress('');
     setOcrProgress({ done: 0, total: 81 });
+    setSolvingSteps(null);
+    setSolvingIndex(0);
+    setLiveBoard(null);
+    setLiveActiveIndex(null);
+    setLiveCaption('');
+    setPendingSolution(null);
+    setPendingMeta(null);
   }, []);
 
   // Listen for "Reset" events from SolutionView
@@ -169,6 +214,16 @@ export default function Home() {
     () => new Set(validation.conflicts.map((c) => c.index)),
     [validation],
   );
+  // Cells the animation has placed so far that weren't originally given —
+  // drives the blue "solved" styling on the live grid during playback.
+  const liveSolvedIndices = useMemo(() => {
+    if (!liveBoard) return new Set<number>();
+    const s = new Set<number>();
+    for (let i = 0; i < 81; i++) {
+      if (liveBoard[i] !== 0 && !recognizedSet.has(i)) s.add(i);
+    }
+    return s;
+  }, [liveBoard, recognizedSet]);
 
   const handleCapture = useCallback(
     async (canvas: HTMLCanvasElement) => {
@@ -215,22 +270,118 @@ export default function Home() {
       toast.error(v.message ?? 'Board has conflicts.');
       return;
     }
-    const result: SolverResult = solveSudoku(board);
+    // The solve itself always runs at full speed regardless of the animate
+    // toggle — recordSteps just also captures a trace of it for replay.
+    // High cap: the tick-batching in the playback effect keeps total watch
+    // time bounded regardless of trace length, so there's no need to
+    // truncate the trace itself (truncating would cause a jarring instant
+    // jump to the final board once the recorded steps run out).
+    const result = solve(board, { algorithm, recordSteps: animateSolving, maxSteps: 50_000 });
     if (!result.solved || !result.solution) {
       toast.error(result.diagnostics ?? 'Could not solve the puzzle.');
       setErrorMsg(result.diagnostics ?? 'Could not solve the puzzle.');
       return;
     }
-    setSolution(result.solution);
-    const solved = new Set<number>();
-    for (let i = 0; i < 81; i++) {
-      if (board[i] === 0 && result.solution[i] !== 0) solved.add(i);
+
+    if (!animateSolving || !result.steps || result.steps.length === 0) {
+      const solved = new Set<number>();
+      for (let i = 0; i < 81; i++) {
+        if (board[i] === 0 && result.solution[i] !== 0) solved.add(i);
+      }
+      setSolution(result.solution);
+      setSolvedSet(solved);
+      setSolverMeta({ elapsedMs: result.elapsedMs, algorithm });
+      setStage('solved');
+      toast.success(`Solved in ${result.elapsedMs} ms`);
+      return;
     }
-    setSolvedSet(solved);
-    setSolverMeta({ elapsedMs: result.elapsedMs });
+
+    setPendingSolution(result.solution);
+    setPendingMeta({ elapsedMs: result.elapsedMs, algorithm });
+    setSolvingSteps(result.steps);
+    setSolvingIndex(0);
+    setLiveBoard(board.slice() as Board);
+    setLiveCaption('Starting…');
+    setLiveActiveIndex(null);
+    setStage('solving');
+  }, [board, algorithm, animateSolving]);
+
+  const finishSolving = useCallback(() => {
+    if (pendingSolution) {
+      const solved = new Set<number>();
+      for (let i = 0; i < 81; i++) {
+        if (board[i] === 0 && pendingSolution[i] !== 0) solved.add(i);
+      }
+      setSolution(pendingSolution);
+      setSolvedSet(solved);
+      setSolverMeta(pendingMeta);
+      toast.success(`Solved in ${pendingMeta?.elapsedMs ?? 0} ms`);
+    }
+    setSolvingSteps(null);
+    setSolvingIndex(0);
+    setLiveBoard(null);
+    setLiveActiveIndex(null);
+    setLiveCaption('');
+    setPendingSolution(null);
+    setPendingMeta(null);
     setStage('solved');
-    toast.success(`Solved in ${result.elapsedMs} ms`);
-  }, [board]);
+  }, [board, pendingSolution, pendingMeta]);
+
+  // Plays back the recorded step trace at a human-watchable pace, with total
+  // playback time kept bounded regardless of trace length (2.5s-18s).
+  //
+  // Two regimes, chosen per-solve from the actual trace length:
+  //  - Short/typical traces (a DLX solve is usually ~1 step per filled cell,
+  //    so ~50-80 steps): one step per tick, ticking at ~140ms — a relaxed,
+  //    individually-readable pace.
+  //  - Long backtracking-heavy traces (a hard puzzle can need thousands of
+  //    try/remove events): a single 140ms-per-step pace would take minutes,
+  //    so instead the tick rate is floored at 40ms and multiple steps are
+  //    applied per tick, batched just enough that the whole trace still
+  //    finishes within the time budget — still visibly stepping through the
+  //    board rather than jumping straight to the answer.
+  useEffect(() => {
+    if (stage !== 'solving' || !solvingSteps) return;
+    if (solvingIndex >= solvingSteps.length) {
+      const handle = window.setTimeout(finishSolving, 0);
+      return () => window.clearTimeout(handle);
+    }
+
+    const total = solvingSteps.length;
+    const targetTotalMs = Math.max(2500, Math.min(18000, total * 140));
+    const idealPerStepMs = targetTotalMs / total;
+    const MIN_TICK_MS = 40;
+    const tickMs = idealPerStepMs >= MIN_TICK_MS ? idealPerStepMs : MIN_TICK_MS;
+    const stepsPerTick =
+      idealPerStepMs >= MIN_TICK_MS ? 1 : Math.max(1, Math.ceil((total * MIN_TICK_MS) / targetTotalMs));
+
+    const timer = window.setTimeout(() => {
+      const end = Math.min(solvingIndex + stepsPerTick, total);
+      let lastMessage = '';
+      let lastIndex: number | null = null;
+      setLiveBoard((prev) => {
+        if (!prev) return prev;
+        const next = prev.slice() as Board;
+        for (let i = solvingIndex; i < end; i++) {
+          const step = solvingSteps[i];
+          if (step.kind === 'try' || step.kind === 'place') {
+            if (step.digit != null) next[step.index] = step.digit;
+            lastIndex = step.index;
+          } else if (step.kind === 'remove') {
+            next[step.index] = 0;
+            lastIndex = step.index;
+          }
+          lastMessage = step.message;
+        }
+        return next;
+      });
+      setLiveActiveIndex(lastIndex);
+      setLiveCaption(lastMessage);
+      setSolvingIndex(end);
+    }, tickMs);
+
+    return () => window.clearTimeout(timer);
+  }, [stage, solvingSteps, solvingIndex, finishSolving]);
 
   const loadSample = useCallback((givens: string) => {
     const digits = givens.split('').map((c) => parseInt(c, 10));
@@ -377,7 +528,7 @@ export default function Home() {
                       <li>Largest 4-point contour is warped into a 450×450 top-down view.</li>
                       <li>81 cells are sliced (10% border trim) and recognized by Tesseract.js (digits 1–9 only).</li>
                       <li>Editable grid lets you fix any misread digit before solving.</li>
-                      <li>Dancing Links (Algorithm X) solves in &lt;50 ms, with an augmented overlay option.</li>
+                      <li>Pick a solving algorithm and watch it work, step by step, with an augmented overlay option.</li>
                     </ol>
                   </div>
                 </CardContent>
@@ -480,6 +631,38 @@ export default function Home() {
                       </div>
                     </div>
                   )}
+
+                  <div className="flex flex-col gap-2">
+                    <span className="text-xs font-medium text-muted-foreground">Algorithm</span>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {ALGORITHMS.map((a) => (
+                        <Button
+                          key={a.id}
+                          type="button"
+                          size="sm"
+                          variant={algorithm === a.id ? 'default' : 'outline'}
+                          onClick={() => setAlgorithm(a.id)}
+                          title={a.description}
+                        >
+                          {a.label}
+                        </Button>
+                      ))}
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {ALGORITHMS.find((a) => a.id === algorithm)?.description}
+                    </p>
+                  </div>
+
+                  <Button
+                    type="button"
+                    variant={animateSolving ? 'default' : 'outline'}
+                    size="sm"
+                    onClick={() => setAnimateSolving(!animateSolving)}
+                    className="justify-start"
+                  >
+                    <Wand2 className="size-4" /> Animate solving: {animateSolving ? 'On' : 'Off'}
+                  </Button>
+
                   <div className="flex flex-col gap-2">
                     <Button onClick={handleSolve} disabled={!validation.valid} size="lg">
                       <Trophy className="size-4" /> Solve puzzle
@@ -488,6 +671,50 @@ export default function Home() {
                       <ArrowLeft className="size-4" /> Start over
                     </Button>
                   </div>
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
+          {stage === 'solving' && liveBoard && solvingSteps && (
+            <div className="grid gap-6 lg:grid-cols-[1fr_320px]">
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2 text-base">
+                    <Wand2 className="size-4" /> Solving — {ALGORITHMS.find((a) => a.id === (pendingMeta?.algorithm ?? algorithm))?.label}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <EditableGrid
+                    value={liveBoard}
+                    recognizedIndices={recognizedSet}
+                    solvedIndices={liveSolvedIndices}
+                    activeIndex={liveActiveIndex}
+                    readOnly
+                  />
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">What it's doing</CardTitle>
+                </CardHeader>
+                <CardContent className="flex flex-col gap-4">
+                  <div
+                    key={solvingIndex}
+                    className="min-h-[3lh] rounded-lg border bg-muted/30 p-3 text-sm animate-in fade-in slide-in-from-bottom-1 duration-150"
+                  >
+                    {liveCaption}
+                  </div>
+                  <Progress value={(solvingIndex / solvingSteps.length) * 100} className="h-2" />
+                  <div className="flex items-center justify-between text-xs text-muted-foreground">
+                    <span>
+                      Step {Math.min(solvingIndex + 1, solvingSteps.length)} / {solvingSteps.length}
+                    </span>
+                  </div>
+                  <Button variant="outline" onClick={finishSolving}>
+                    <FastForward className="size-4" /> Skip to result
+                  </Button>
                 </CardContent>
               </Card>
             </div>
@@ -531,7 +758,9 @@ export default function Home() {
                   </div>
                   <div className="flex items-center justify-between">
                     <span>Algorithm</span>
-                    <Badge variant="outline">DLX (Algorithm X)</Badge>
+                    <Badge variant="outline">
+                      {ALGORITHMS.find((a) => a.id === solverMeta?.algorithm)?.label ?? 'Dancing Links'}
+                    </Badge>
                   </div>
                   <Button variant="outline" onClick={reset} className="mt-2">
                     <ArrowRight className="size-4" /> Solve another
@@ -543,7 +772,7 @@ export default function Home() {
         </section>
 
         <footer className="mt-auto border-t pt-4 text-center text-xs text-muted-foreground">
-          Built with Next.js · OpenCV.js (WebAssembly, Web Worker) · Tesseract.js · Dancing Links · 100% in-browser
+          Built with Next.js · OpenCV.js (WebAssembly, Web Worker) · Tesseract.js · 3 solving algorithms · 100% in-browser
         </footer>
       </div>
     </main>
@@ -555,6 +784,7 @@ function Stepper({ stage }: { stage: Stage }) {
     { key: 'capture', label: 'Capture', icon: <Camera className="size-3.5" /> },
     { key: 'processing', label: 'Detect', icon: <ScanLine className="size-3.5" /> },
     { key: 'review', label: 'Review', icon: <PencilLine className="size-3.5" /> },
+    { key: 'solving', label: 'Solving', icon: <Wand2 className="size-3.5" /> },
     { key: 'solved', label: 'Solved', icon: <Trophy className="size-3.5" /> },
   ];
   const activeIdx = steps.findIndex((s) => s.key === stage);
