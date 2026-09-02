@@ -40,12 +40,21 @@ export const metadata: Metadata = {
     description: "Camera-to-solution Sudoku solver. 100% client-side, works offline.",
     type: "website",
   },
+  other: {
+    // Next 16's `appleWebApp.capable` only emits the modern unprefixed
+    // "mobile-web-app-capable" tag. Older/some current iOS Safari versions
+    // still key standalone (full-screen, no browser chrome) launch off the
+    // Apple-prefixed tag specifically — without it, "Add to Home Screen"
+    // opens inside Safari instead of as an installed app.
+    "apple-mobile-web-app-capable": "yes",
+  },
 };
 
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
+  viewportFit: "cover",
   themeColor: [
     { media: "(prefers-color-scheme: light)", color: "#ffffff" },
     { media: "(prefers-color-scheme: dark)", color: "#0a0a0a" },
