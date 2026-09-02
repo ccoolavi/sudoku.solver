@@ -5,13 +5,20 @@
 // Strategy:
 //  - Precache the app shell + the heavy CV/OCR assets on install, so the very first
 //    visit already has everything needed to work offline afterwards.
-//  - Cache-first for same-origin GET requests (this app never calls a backend —
-//    every asset is either static or produced entirely in the browser).
-//  - Runtime requests that aren't precached (e.g. hashed JS/CSS chunks Next.js
-//    generates per build) are cached the first time they're fetched, so a second
-//    visit is fully offline too.
+//  - Navigations (the HTML document) are network-FIRST, cache as fallback. Next.js
+//    content-hashes every JS/CSS chunk filename per build, so a stale cached HTML
+//    document references chunk URLs from a previous deploy that no longer exist on
+//    the server — cache-first here would mean "revisit after we ship an update" =
+//    a page that looks broken/unstyled (missing CSS) with no obvious cause. Only
+//    when the network is unreachable (actually offline) does it fall back to the
+//    last cached shell, restoring state from localStorage client-side.
+//  - Cache-first for everything else (JS/CSS/wasm/images) — safe *because* those
+//    filenames are content-hashed and immutable; a new build simply references new
+//    filenames, so a stale cache entry under an old name is never served by mistake.
+//  - Runtime requests that aren't precached are cached the first time they're
+//    fetched, so a second visit is fully offline too.
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const CACHE_NAME = `sudoku-solver-${CACHE_VERSION}`;
 
 // Directory this service worker file lives in — works whether the app is served
@@ -70,24 +77,39 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
 
+  // Navigations (the HTML shell): network-first. See the strategy note above —
+  // this is what prevents "revisit after a deploy" from serving a page that
+  // references JS/CSS filenames the new deploy no longer has.
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      (async () => {
+        try {
+          const response = await fetch(request);
+          if (response.ok) {
+            const cache = await caches.open(CACHE_NAME);
+            cache.put(BASE_PATH, response.clone());
+          }
+          return response;
+        } catch {
+          const cache = await caches.open(CACHE_NAME);
+          const shell = await cache.match(BASE_PATH);
+          if (shell) return shell;
+          throw new Error('Offline and no cached shell available');
+        }
+      })(),
+    );
+    return;
+  }
+
+  // Everything else: cache-first (safe — content-hashed, immutable filenames).
   event.respondWith(
     caches.open(CACHE_NAME).then(async (cache) => {
       const cached = await cache.match(request);
       if (cached) return cached;
 
-      try {
-        const response = await fetch(request);
-        if (response.ok) cache.put(request, response.clone());
-        return response;
-      } catch (err) {
-        // Offline and not cached: for navigations, fall back to the shell so the
-        // app still boots (it restores state from localStorage client-side).
-        if (request.mode === 'navigate') {
-          const shell = await cache.match(BASE_PATH);
-          if (shell) return shell;
-        }
-        throw err;
-      }
+      const response = await fetch(request);
+      if (response.ok) cache.put(request, response.clone());
+      return response;
     }),
   );
 });
